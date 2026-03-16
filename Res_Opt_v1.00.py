@@ -68,9 +68,13 @@ import sys
 import threading
 import queue
 
-VERSION = "1.27"
+VERSION = "1.28"
 
 CHANGELOG = {
+    "1.28": "Rser optimisation now tweaks Cs via coordinate descent (reseed=False) "
+            "at each Rser candidate instead of holding Cs fixed. Preserves "
+            "optimised Cs values and avoids full redistribution. Writes tweaked Cs "
+            "back to panel and marks _cs_optimized=True on completion.",
     "1.27": "Main panel redesigned: window narrowed to 520px, Fundamental (MHz) "
             "moved below resonator table with font size 16, default frequency "
             "changed to 33 MHz.",
@@ -1006,35 +1010,39 @@ class ResonatorApp:
         return best_cs
 
     def _joint_optimise_cs(self, params, n_active, f0,
-                           Rload, Cload, Lload, Rser, R_div2):
+                           Rload, Cload, Lload, Rser, R_div2, reseed=True):
         """
         Jointly re-optimise Cs[0..n_active-1] using coordinate descent.
 
-        Step 1 — initialise: set Cs[i] to the exact series-resonance value
-                 for harmonic (i+1)*f0, i.e. Cs = 1/(L*(2π*f_target)²).
-                 This ensures each resonator starts tuned to the right harmonic
-                 regardless of whatever Cs values were in params before.
+        reseed=True  (default): Step 1 reinitialises all Cs from series-resonance
+                     values before optimising.  Use this for a full optimisation.
+        reseed=False: skip Step 1 and run coordinate descent from the current Cs
+                     values.  Use this for a gentle tweak (e.g. after Rser scan)
+                     so existing tuning is preserved and only small adjustments
+                     are made.
 
-        Step 2 — sequential pass: optimise Cs[0] at f0, then Cs[1] at 2*f0
-                 (with Cs[0] already set), etc. — each subsequent resonator
-                 sees the correctly-tuned previous ones.
+        Step 1 — initialise (reseed=True only): set Cs[i] to 2× series-resonance
+                 for harmonic (i+1)*f0, then run a forward sequential pass.
+
+        Step 2 — sequential pass: optimise Cs[0] at f0, then Cs[1] at 2*f0, etc.
 
         Step 3 — coordinate-descent rounds: cycle until convergence.
         """
         if n_active == 0:
             return
 
-        # ── Step 1: seed Cs just above series resonance for each harmonic ────
-        # We want parallel anti-resonance (high Z), which requires Cs > cs_series_res
-        # so the L+Cs branch is net inductive at f_target.  Seed at 2x cs_series_res.
-        for i in range(n_active):
-            L = params[i, 2]
-            f_target = (i + 1) * f0
-            if L > 0:
-                cs_series_res = 1.0 / (L * (2.0 * np.pi * f_target) ** 2)
-                params[i, 5] = np.clip(cs_series_res * 2.0, 0.001e-12, 1000e-12)  # FIX-2: lower floor
-            else:
-                params[i, 5] = 1e-12   # fallback
+        if reseed:
+            # ── Step 1: seed Cs just above series resonance for each harmonic ─
+            # We want parallel anti-resonance (high Z), which requires Cs > cs_series_res
+            # so the L+Cs branch is net inductive at f_target.  Seed at 2x cs_series_res.
+            for i in range(n_active):
+                L = params[i, 2]
+                f_target = (i + 1) * f0
+                if L > 0:
+                    cs_series_res = 1.0 / (L * (2.0 * np.pi * f_target) ** 2)
+                    params[i, 5] = np.clip(cs_series_res * 2.0, 0.001e-12, 1000e-12)  # FIX-2: lower floor
+                else:
+                    params[i, 5] = 1e-12   # fallback
 
         # ── Step 2: sequential forward pass — each resonator sees correctly
         #            initialised neighbours ────────────────────────────────────
@@ -2197,11 +2205,13 @@ class ResonatorApp:
             GS_ITERS = 10                 # function evaluations
 
             def fom_at(rser_val):
-                # Keep Cs fixed — they were optimised by Best Inductor Search
-                # for the original Rser.  Re-optimising Cs here using the
-                # ratio proxy discards that work and produces worse results.
-                # After finding the best Rser the user can re-run Cs optimisation.
+                # Tweak Cs via coordinate descent from current values (reseed=False)
+                # so the optimised Cs are preserved and only slightly adjusted
+                # for the new Rser — avoids full redistribution.
                 p = fixed_par.copy()
+                self._joint_optimise_cs(
+                    p, len(p), f0, Rload, Cload, Lload, rser_val, R_div2,
+                    reseed=False)
                 fom = self._compute_fom(
                     p, f0, mags, phases,
                     R_gen, R_div1, R_div2, C_line, Z_in,
@@ -2236,13 +2246,12 @@ class ResonatorApp:
 
         def _done(best_rser, best_fom, p_final):
             self.Rser.set(round(best_rser, 2))
-            # Cs unchanged — Rser scan used fixed Cs from Best Inductor Search.
-            # Mark stale so user is prompted to re-run Cs optimisation.
-            self._cs_optimized = False
+            self._update_grid_cs(p_final)
+            self._cs_optimized = True
             self._led_stop()
             self.status_var.set(
                 f"Rser opt done: best Rser={best_rser:.1f} Ω  FOM={best_fom:.2f}%"
-                f"  — re-run Cs Optimisation to fine-tune")
+                f"  (Cs tweaked)")
             try:
                 self._optim_rser_btn.configure(state="normal")
                 self._optim_run_btn.configure(state="normal")
