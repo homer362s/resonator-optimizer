@@ -68,34 +68,9 @@ import sys
 import threading
 import queue
 
-VERSION = "1.35"
+VERSION = "1.29"
 
 CHANGELOG = {
-    "1.35": "Added _run_iterate_optimization: alternating Cs / Rser optimisation "
-            "that finds the joint steady solution. New button '⟳ Iterate Rser+Cs' "
-            "in the Best Inductors window. Each round: (1) re-optimise Cs with "
-            "current Rser, (2) golden-section sweep of Rser with fixed Cs. Repeats "
-            "up to 6 rounds or until ΔFOM < 0.02 %. Both Rser and Cs are written "
-            "back to the GUI on completion.",
-    "1.34": "Rser optimisation: Cs now completely fixed during the sweep — only Rser "
-            "varies. _done writes back Rser only (not Cs). This keeps frequency "
-            "analysis current ratios unchanged and makes resetting Rser reproducible. "
-            "Previous versions modified Cs (reseed=False or reseed=True), causing "
-            "frequency analysis to change and different results on Rser reset.",
-    "1.33": "Rser optimisation: use reseed=True (full Cs re-optimisation) at each "
-            "candidate Rser so FOM is evaluated with the best possible Cs for that "
-            "Rser — same as Best Inductors search. Previous reseed=False caused "
-            "suboptimal Cs at non-original Rser values, making the search unable "
-            "to find improvements above the starting FOM.",
-    "1.32": "Fix NameError: canvas→cv in inductor selector WM_DELETE_WINDOW handler.",
-    "1.31": "Arrange proportional: on inductor selection, compute Cs₀ that satisfies "
-            "the current Fundamental frequency (not the reverse). Cs₀ written to slot 0 "
-            "in the resonator grid. Label shows 'Cs₀≈ X pF' instead of f₀.",
-    "1.30": "Best Inductors window redesigned: GA/Greedy and SA parameters grouped "
-            "in labelled sections, shown/hidden based on selected mode. "
-            "Added 'Arrange proportional' checkbox: fixes slot 0 to a chosen "
-            "inductor from DB and sets f₀ from its anti-resonance frequency. "
-            "Steady State: Show V_gen default changed to OFF.",
     "1.29": "Robust Fundamental input: _get_f_fundamental() wraps all .get() calls "
             "with try/except, resets to 33 MHz on invalid input instead of crashing. "
             "Large Fundamental entry uses tk.Entry (reliable font support).",
@@ -186,10 +161,6 @@ class ResonatorApp:
         self.sa_t0    = tk.DoubleVar(value=20.0)   # initial temperature (FOM % units)
         self.sa_alpha = tk.DoubleVar(value=0.97)  # cooling rate per step
         self.sa_iters = tk.IntVar(value=300)       # total SA steps
-        self.arrange_proportional = tk.BooleanVar(value=False)
-        self.prop_inductor_var    = tk.StringVar(value="")
-        self._prop_db_idx         = None
-        self._prop_combo          = None
 
         # --- Menu Bar ---
         menubar = tk.Menu(self.root)
@@ -275,7 +246,7 @@ class ResonatorApp:
         self.s_param_choice  = tk.StringVar(value="Both")
         self.f_fundamental   = tk.DoubleVar(value=33.0)
         self.subtract_ref_var = tk.BooleanVar(value=False)
-        self.show_vgen_var    = tk.BooleanVar(value=False)
+        self.show_vgen_var    = tk.BooleanVar(value=True)
         self.ref_calc_var     = tk.BooleanVar(value=False)
         self._cs_optimized = False
         self._ga_running   = False
@@ -443,11 +414,6 @@ class ResonatorApp:
             self.inductor_db_path.set(os.path.basename(filepath))
             self.status_var.set(f"Loaded {len(df)} inductors from {os.path.basename(filepath)}")
             self._rebuild_inductor_menu()
-            if self._prop_combo is not None:
-                try:
-                    self._refresh_prop_combo()
-                except Exception:
-                    pass
             # Default Pop = DB size; update combobox if already open
             K = len(df)
             self.ga_pop.set(K)
@@ -672,7 +638,7 @@ class ResonatorApp:
 
         # Unbind mousewheel when dialog closes
         dlg.protocol("WM_DELETE_WINDOW",
-                     lambda: (cv.unbind_all("<MouseWheel>"), dlg.destroy()))
+                     lambda: (canvas.unbind_all("<MouseWheel>"), dlg.destroy()))
 
     def _apply_inductors_to_resonator_grid(self):
         """
@@ -1572,7 +1538,6 @@ class ResonatorApp:
                 self._optim_run_btn.configure(state="disabled")
                 self._optim_stop_btn.configure(state="normal")
                 self._optim_rser_btn.configure(state="disabled")
-                self._optim_iter_btn.configure(state="disabled")
             except Exception: pass
         except Exception: pass
         self.status_var.set("GA: initialising…")
@@ -1597,8 +1562,6 @@ class ResonatorApp:
             return fom, params, list(individual)
 
         mode = self.ga_mode.get()   # "Greedy", "GA only", "Greedy+GA"
-        do_arrange_prop = self.arrange_proportional.get()
-        prop_db_idx     = self._prop_db_idx
 
         def ga_worker():
           try:
@@ -1670,23 +1633,6 @@ class ResonatorApp:
 
                 import time as _time
                 for k in range(N):
-                    # Arrange proportional: slot 0 fixed — skip DB scan
-                    if do_arrange_prop and prop_db_idx is not None and k == 0:
-                        q.put(('status',
-                               f"Arrange proportional: slot 0 = "
-                               f"{db_rows[prop_db_idx]['Part_Number']}"))
-                        fom_p, par_p, _ = evaluate([prop_db_idx])
-                        greedy_ind    = [prop_db_idx]
-                        greedy_params = par_p
-                        best_ind      = greedy_ind[:]
-                        best_par      = par_p
-                        best_fom      = fom_p
-                        gen_best.append(best_fom)
-                        gen_mean.append(best_fom)
-                        q.put(('gen', len(gen_best)-1, gen_best[:], gen_mean[:],
-                               best_ind, best_par, best_fom))
-                        continue
-
                     if not self._ga_running:
                         if best_par is None:
                             best_par = self._optimise_cs_for_individual(
@@ -1781,10 +1727,7 @@ class ResonatorApp:
                 lst = list(ind)
                 while len(lst) < N:
                     lst.append(int(rng.integers(0, DB_SIZE)))
-                lst = lst[:N]   # also truncate if somehow longer
-                if do_arrange_prop and prop_db_idx is not None:
-                    lst[0] = prop_db_idx
-                return lst
+                return lst[:N]   # also truncate if somehow longer
 
             seed_ind = pad_to_N(best_ind)
 
@@ -1883,9 +1826,6 @@ class ResonatorApp:
 
                     # Mutation
                     for i in range(N):
-                        if do_arrange_prop and prop_db_idx is not None and i == 0:
-                            child[i] = prop_db_idx  # preserve fixed first inductor
-                            continue
                         if rng.random() < MUT_RATE:
                             child[i] = int(rng.integers(0, DB_SIZE))
 
@@ -2046,7 +1986,6 @@ class ResonatorApp:
                         self._optim_run_btn.configure(state="normal")
                         self._optim_stop_btn.configure(state="disabled")
                         self._optim_rser_btn.configure(state="normal")
-                        self._optim_iter_btn.configure(state="normal")
                     except Exception: pass
                     self._save_ga_progress_prompt(gb_final, gm_final, names, best_fom)
                     done_flag = True
@@ -2101,8 +2040,6 @@ class ResonatorApp:
                 alpha_sa = self.sa_alpha.get()
                 iters_sa = self.sa_iters.get()
                 rng_sa   = np.random.default_rng(42)
-                sa_arrange_prop = do_arrange_prop
-                sa_prop_idx     = prop_db_idx
 
                 # ── Seed: best of up to 50 random trials (avoids negative start) ──
                 MAX_SEED = 50
@@ -2119,8 +2056,6 @@ class ResonatorApp:
                            f"SA: seeding {attempt+1}/{MAX_SEED}"
                            f"  best so far={best_seed_fom:.2f}%"))
                     trial_ind = list(rng_sa.integers(0, DB_SIZE, N))
-                    if sa_arrange_prop and sa_prop_idx is not None:
-                        trial_ind[0] = sa_prop_idx
                     trial_fom, trial_par, _ = evaluate(trial_ind)
                     if trial_fom > best_seed_fom:
                         best_seed_fom = trial_fom
@@ -2157,22 +2092,17 @@ class ResonatorApp:
                     roll = rng_sa.random()
                     neighbor = current_ind[:]
                     if roll < 0.60 or N == 1:
-                        # Single swap — avoid slot 0 if fixed
-                        lo = 1 if (sa_arrange_prop and sa_prop_idx is not None and N > 1) else 0
-                        i = int(rng_sa.integers(lo, N))
+                        # Single swap
+                        i = int(rng_sa.integers(0, N))
                         neighbor[i] = int(rng_sa.integers(0, DB_SIZE))
                     elif roll < 0.90:
                         # Double swap
-                        lo = 1 if (sa_arrange_prop and sa_prop_idx is not None and N > 1) else 0
-                        idxs = rng_sa.choice(range(lo, N), size=min(2, N - lo), replace=False)
+                        idxs = rng_sa.choice(N, size=min(2, N), replace=False)
                         for i in idxs:
                             neighbor[i] = int(rng_sa.integers(0, DB_SIZE))
                     else:
                         # Full random restart — helps escape deep basins
                         neighbor = list(rng_sa.integers(0, DB_SIZE, N))
-                    # Enforce fixed first inductor
-                    if sa_arrange_prop and sa_prop_idx is not None:
-                        neighbor[0] = sa_prop_idx
 
                     neighbor_fom, neighbor_par, _ = evaluate(neighbor)
                     delta = neighbor_fom - current_fom
@@ -2286,11 +2216,13 @@ class ResonatorApp:
             GS_ITERS = 10                 # function evaluations
 
             def fom_at(rser_val):
-                # Cs are kept exactly as optimised by Best Inductors search.
-                # Only Rser varies — this keeps the resonator current ratios
-                # (frequency analysis) unchanged, as they depend solely on
-                # L and Cs, not on Rser.
+                # Tweak Cs via coordinate descent from current values (reseed=False)
+                # so the optimised Cs are preserved and only slightly adjusted
+                # for the new Rser — avoids full redistribution.
                 p = fixed_par.copy()
+                self._joint_optimise_cs(
+                    p, len(p), f0, Rload, Cload, Lload, rser_val, R_div2,
+                    reseed=False)
                 fom = self._compute_fom(
                     p, f0, mags, phases,
                     R_gen, R_div1, R_div2, C_line, Z_in,
@@ -2325,135 +2257,13 @@ class ResonatorApp:
 
         def _done(best_rser, best_fom, p_final):
             self.Rser.set(round(best_rser, 2))
-            # Cs unchanged — Rser sweep uses fixed Cs so frequency analysis
-            # (current ratios) is unaffected.
+            self._update_grid_cs(p_final)
+            self._cs_optimized = True
             self._led_stop()
             self.status_var.set(
-                f"Rser opt done: best Rser={best_rser:.1f} Ω  FOM={best_fom:.2f}%")
+                f"Rser opt done: best Rser={best_rser:.1f} Ω  FOM={best_fom:.2f}%"
+                f"  (Cs tweaked)")
             try:
-                self._optim_rser_btn.configure(state="normal")
-                self._optim_run_btn.configure(state="normal")
-            except Exception: pass
-
-        import threading as _thr
-        _thr.Thread(target=worker, daemon=True).start()
-
-    def _run_iterate_optimization(self):
-        """
-        Alternating (Cs, Rser) optimisation — finds the joint steady solution.
-
-        Each round:
-          1. Optimise Cs with the current Rser  (_joint_optimise_cs)
-          2. Sweep Rser via golden-section with those fixed Cs
-        Repeat until FOM change < 0.02 % or MAX_ROUNDS reached.
-
-        Both best Rser and best Cs are written back to the GUI at the end.
-        """
-        params = self._get_resonator_params_from_gui()
-        N = len(params)
-        if N == 0:
-            from tkinter import messagebox
-            messagebox.showwarning("No resonators", "Load resonators first.")
-            return
-
-        rser_lo = self.ga_rser_min.get()
-        rser_hi = self.ga_rser_max.get()
-        if rser_lo >= rser_hi or rser_lo <= 0:
-            from tkinter import messagebox
-            messagebox.showwarning("Invalid range",
-                                   f"Rser range {rser_lo}–{rser_hi} Ω is invalid.")
-            return
-
-        try:
-            mags, phases, _ = self._load_stimulus()
-        except Exception as e:
-            from tkinter import messagebox
-            messagebox.showerror("Stimulus error", str(e))
-            return
-
-        f0     = self._get_f_fundamental() * 1e6
-        Rload  = self.Rload.get()
-        Cload  = self.Cload.get()
-        Lload  = self.Lload.get()
-        R_div2 = self.R_div2.get()
-        R_div1 = self.R_div1.get()
-        R_gen  = self.R_internal_gen.get()
-        Z_in   = self.Z_in_measure.get()
-        C_line = 0.0
-        Rser_start = self.Rser.get()
-
-        self._led_start()
-        try:
-            self._optim_iter_btn.configure(state="disabled")
-            self._optim_rser_btn.configure(state="disabled")
-            self._optim_run_btn.configure(state="disabled")
-        except Exception: pass
-        self.status_var.set("Iterate Rser+Cs: starting…")
-        self.root.update_idletasks()
-
-        def worker():
-            PHI = (np.sqrt(5) - 1) / 2
-            GS_ITERS   = 12
-            MAX_ROUNDS = 6
-            CONV_TOL   = 0.02   # % — stop when ΔFOM < this
-
-            p = params.copy()
-            cur_rser = Rser_start
-            prev_fom = None
-
-            for rnd in range(MAX_ROUNDS):
-                # ── Step A: optimise Cs with current Rser ─────────────────────
-                self.root.after(0, lambda r=rnd: self.status_var.set(
-                    f"Iterate {r+1}/{MAX_ROUNDS}: optimising Cs (Rser={cur_rser:.1f} Ω)…"))
-                self._joint_optimise_cs(
-                    p, N, f0,
-                    Rload, Cload, Lload, cur_rser, R_div2,
-                    reseed=(rnd == 0))
-
-                # ── Step B: golden-section over Rser with fixed Cs ────────────
-                self.root.after(0, lambda r=rnd: self.status_var.set(
-                    f"Iterate {r+1}/{MAX_ROUNDS}: sweeping Rser…"))
-
-                def fom_at(rser_val, _p=p):
-                    return self._compute_fom(
-                        _p, f0, mags, phases,
-                        R_gen, R_div1, R_div2, C_line, Z_in,
-                        rser_val, Rload, Cload, Lload)
-
-                a, b = rser_lo, rser_hi
-                c = b - PHI * (b - a)
-                d = a + PHI * (b - a)
-                fc = fom_at(c)
-                fd = fom_at(d)
-                for _ in range(GS_ITERS - 2):
-                    if fc > fd:
-                        b = d; d, fd = c, fc
-                        c = b - PHI * (b - a); fc = fom_at(c)
-                    else:
-                        a = c; c, fc = d, fd
-                        d = a + PHI * (b - a); fd = fom_at(d)
-                cur_rser = (a + b) / 2.0
-                new_fom  = fom_at(cur_rser)
-
-                # ── Convergence check ─────────────────────────────────────────
-                if prev_fom is not None and abs(new_fom - prev_fom) < CONV_TOL:
-                    prev_fom = new_fom
-                    break
-                prev_fom = new_fom
-
-            best_rser = cur_rser
-            best_fom  = prev_fom
-            best_p    = p.copy()
-            self.root.after(0, lambda: _done(best_rser, best_fom, best_p))
-
-        def _done(best_rser, best_fom, best_p):
-            self.Rser.set(round(best_rser, 2))
-            self._update_grid_cs(best_p)
-            self._led_stop()
-            self.status_var.set(
-                f"Iterate done: Rser={best_rser:.1f} Ω  FOM={best_fom:.2f}%")
-            try:
-                self._optim_iter_btn.configure(state="normal")
                 self._optim_rser_btn.configure(state="normal")
                 self._optim_run_btn.configure(state="normal")
             except Exception: pass
@@ -2609,127 +2419,51 @@ class ResonatorApp:
 
         elif key == 'optim':
             p = parent
-
-            # ── Row 0: Mode + N inductors ───────────────────────────────────
-            r0 = ttk.Frame(p); r0.pack(fill=tk.X, pady=2)
+            r0 = ttk.Frame(p); r0.pack(fill=tk.X, pady=1)
             ttk.Label(r0, text="Mode:", width=8, anchor="w").pack(side=tk.LEFT)
             for m in ("Greedy", "GA only", "Greedy+GA", "SA"):
                 ttk.Radiobutton(r0, text=m, variable=self.ga_mode,
                                 value=m).pack(side=tk.LEFT, padx=(0,4))
-            ttk.Label(r0, text="  N:", anchor="w").pack(side=tk.LEFT)
-            ttk.Combobox(r0, textvariable=self.ga_n_res,
-                         values=list(range(1, 13)), state="readonly",
-                         width=4).pack(side=tk.LEFT, padx=(2,0))
 
-            # ── GA/Greedy parameters (hidden when mode=SA) ──────────────────
-            r_ga = ttk.LabelFrame(p, text="GA / Greedy parameters", padding="4 2 4 2")
-            r_ga.pack(fill=tk.X, pady=(2,0))
-            ttk.Label(r_ga, text="Pop:").pack(side=tk.LEFT)
-            self._pop_combobox = ttk.Combobox(r_ga, textvariable=self.ga_pop,
+            r1 = ttk.Frame(p); r1.pack(fill=tk.X, pady=1)
+            ttk.Label(r1, text="N inductors:", width=10, anchor="w").pack(side=tk.LEFT)
+            ttk.Combobox(r1, textvariable=self.ga_n_res,
+                         values=list(range(1, 13)), state="readonly",
+                         width=4).pack(side=tk.LEFT, padx=(0,12))
+            ttk.Label(r1, text="Pop:").pack(side=tk.LEFT)
+            self._pop_combobox = ttk.Combobox(r1, textvariable=self.ga_pop,
                          values=[10,20,30,50], state="readonly", width=5)
             self._pop_combobox.pack(side=tk.LEFT, padx=(2,8))
-            ttk.Label(r_ga, text="Gen:").pack(side=tk.LEFT)
-            ttk.Combobox(r_ga, textvariable=self.ga_gen,
+            ttk.Label(r1, text="Gen:").pack(side=tk.LEFT)
+            ttk.Combobox(r1, textvariable=self.ga_gen,
                          values=[10,20,40,80], state="readonly",
-                         width=4).pack(side=tk.LEFT, padx=(2,12))
-            ttk.Label(r_ga, text="Keep if ΔFOM ≥", anchor="w").pack(side=tk.LEFT)
-            ttk.Entry(r_ga, textvariable=self.ga_min_contrib,
+                         width=4).pack(side=tk.LEFT, padx=(2,0))
+
+            r2 = ttk.Frame(p); r2.pack(fill=tk.X, pady=1)
+            ttk.Label(r2, text="Keep if ΔFOM ≥", anchor="w").pack(side=tk.LEFT)
+            ttk.Entry(r2, textvariable=self.ga_min_contrib,
                       width=5).pack(side=tk.LEFT, padx=(2,2))
-            ttk.Label(r_ga, text="%  (0 = keep all)").pack(side=tk.LEFT)
+            ttk.Label(r2, text="%  (leave-one-out; 0 = keep all)").pack(side=tk.LEFT)
 
-            # ── SA parameters (hidden unless mode=SA) ───────────────────────
-            r_sa = ttk.LabelFrame(p, text="SA parameters", padding="4 2 4 2")
-            # not packed initially
-            ttk.Label(r_sa, text="T₀").pack(side=tk.LEFT)
-            ttk.Entry(r_sa, textvariable=self.sa_t0,    width=6).pack(side=tk.LEFT, padx=(2,8))
-            ttk.Label(r_sa, text="α").pack(side=tk.LEFT)
-            ttk.Entry(r_sa, textvariable=self.sa_alpha, width=6).pack(side=tk.LEFT, padx=(2,8))
-            ttk.Label(r_sa, text="Steps").pack(side=tk.LEFT)
-            ttk.Entry(r_sa, textvariable=self.sa_iters, width=6).pack(side=tk.LEFT, padx=(2,0))
-
-            def _refresh_mode_rows(*_):
-                if self.ga_mode.get() == 'SA':
-                    r_ga.pack_forget()
-                    r_sa.pack(fill=tk.X, pady=(2,0))
-                else:
-                    r_sa.pack_forget()
-                    r_ga.pack(fill=tk.X, pady=(2,0))
-            self.ga_mode.trace_add("write", _refresh_mode_rows)
-
-            # ── Arrange proportional ────────────────────────────────────────
-            r_prop = ttk.Frame(p); r_prop.pack(fill=tk.X, pady=(4,0))
-            ttk.Checkbutton(r_prop, text="Arrange proportional",
-                            variable=self.arrange_proportional).pack(side=tk.LEFT)
-            _prop_inner = ttk.Frame(r_prop)
-            ttk.Label(_prop_inner, text="  1st inductor:").pack(side=tk.LEFT)
-            self._prop_combo = ttk.Combobox(_prop_inner, textvariable=self.prop_inductor_var,
-                                            width=18, state="disabled")
-            self._prop_combo.pack(side=tk.LEFT, padx=(2,6))
-            self._prop_f0_lbl = ttk.Label(_prop_inner, text="Cs₀≈ —", foreground="blue")
-            self._prop_f0_lbl.pack(side=tk.LEFT)
-
-            def _on_prop_toggle(*_):
-                if self.arrange_proportional.get():
-                    _prop_inner.pack(side=tk.LEFT)
-                    _refresh_prop_combo()
-                else:
-                    _prop_inner.pack_forget()
-                    self._prop_db_idx = None
-            self.arrange_proportional.trace_add("write", _on_prop_toggle)
-
-            def _refresh_prop_combo():
-                if self.inductor_db is None or self.inductor_db.empty:
-                    self._prop_combo.configure(values=["(load DB first)"], state="disabled")
-                else:
-                    names = list(self.inductor_db["Part_Number"])
-                    self._prop_combo.configure(values=names, state="readonly")
-            self._refresh_prop_combo = _refresh_prop_combo
-
-            def _on_prop_inductor_selected(event=None):
-                if self.inductor_db is None:
-                    return
-                name = self.prop_inductor_var.get()
-                rows = self.inductor_db[self.inductor_db["Part_Number"] == name]
-                if rows.empty:
-                    return
-                row = rows.iloc[0].to_dict()
-                self._prop_db_idx = int(self.inductor_db.index.get_loc(rows.index[0]))
-                try:
-                    # Use current f₀ — compute Cs₀ that makes this inductor
-                    # anti-resonate at f₀, then write it to slot 0 in the grid.
-                    f0_cur = self._get_f_fundamental() * 1e6
-                    Rload  = self.Rload.get()
-                    Cload  = self.Cload.get()
-                    Lload  = self.Lload.get()
-                    Rser   = self.Rser.get()
-                    R_div2 = self.R_div2.get()
-                    params = np.array([self._db_row_to_params(row)])
-                    Cs_opt = self._cs_for_max_ratio(
-                        params, 0, f0_cur, Rload, Cload, Lload, Rser, R_div2)
-                    if Cs_opt > 0:
-                        cs_pf = Cs_opt * 1e12
-                        self._prop_f0_lbl.configure(text=f"Cs₀≈ {cs_pf:.4g} pF")
-                        # Write Cs to slot 0 entry in the resonator grid
-                        if self.resonator_entry_widgets:
-                            w = self.resonator_entry_widgets[0][5]
-                            w.delete(0, tk.END)
-                            w.insert(0, f"{cs_pf:.6g}")
-                    else:
-                        self._prop_f0_lbl.configure(text="Cs₀≈ —")
-                except Exception:
-                    self._prop_f0_lbl.configure(text="Cs₀≈ err")
-            self._prop_combo.bind("<<ComboboxSelected>>", _on_prop_inductor_selected)
-
-            # ── Rser range ──────────────────────────────────────────────────
-            r_rser = ttk.Frame(p); r_rser.pack(fill=tk.X, pady=(4,0))
-            ttk.Label(r_rser, text="Rser range (Ω):").pack(side=tk.LEFT)
-            ttk.Entry(r_rser, textvariable=self.ga_rser_min,
-                      width=6).pack(side=tk.LEFT, padx=(4,1))
-            ttk.Label(r_rser, text="–").pack(side=tk.LEFT)
-            ttk.Entry(r_rser, textvariable=self.ga_rser_max,
+            r3 = ttk.Frame(p); r3.pack(fill=tk.X, pady=1)
+            ttk.Label(r3, text="range (Ω):").pack(side=tk.LEFT)
+            ttk.Entry(r3, textvariable=self.ga_rser_min,
+                      width=6).pack(side=tk.LEFT, padx=(2,1))
+            ttk.Label(r3, text="–").pack(side=tk.LEFT)
+            ttk.Entry(r3, textvariable=self.ga_rser_max,
                       width=6).pack(side=tk.LEFT, padx=(1,0))
 
-            # ── Buttons ─────────────────────────────────────────────────────
+            # SA-specific parameters row
+            r3b = ttk.Frame(p); r3b.pack(fill=tk.X, pady=1)
+            ttk.Label(r3b, text="SA:  T₀", anchor="w").pack(side=tk.LEFT)
+            ttk.Entry(r3b, textvariable=self.sa_t0,    width=5).pack(side=tk.LEFT, padx=(2,6))
+            ttk.Label(r3b, text="α").pack(side=tk.LEFT)
+            ttk.Entry(r3b, textvariable=self.sa_alpha, width=5).pack(side=tk.LEFT, padx=(2,6))
+            ttk.Label(r3b, text="Steps").pack(side=tk.LEFT)
+            ttk.Entry(r3b, textvariable=self.sa_iters, width=5).pack(side=tk.LEFT, padx=(2,0))
+            ttk.Label(r3b, text="  (used only when mode=SA)",
+                      foreground="grey", font=("TkDefaultFont", 8)).pack(side=tk.LEFT, padx=(6,0))
+
             r4 = ttk.Frame(p); r4.pack(fill=tk.X, pady=(6,2))
             def _run_search():
                 self.analysis_choice.set("Best Inductors")
@@ -2745,12 +2479,7 @@ class ResonatorApp:
                                                command=self._run_rser_optimization,
                                                state="disabled")
             self._optim_rser_btn.pack(side=tk.LEFT, padx=(0,4))
-            ttk.Separator(r4, orient="vertical").pack(side=tk.LEFT, fill="y", padx=6)
-            self._optim_iter_btn = ttk.Button(r4, text="⟳ Iterate Rser+Cs",
-                                               command=self._run_iterate_optimization,
-                                               state="disabled")
-            self._optim_iter_btn.pack(side=tk.LEFT, padx=(0,4))
-            ttk.Label(r4, text="(joint steady solution)",
+            ttk.Label(r4, text="(run after Find Best Inductors)",
                       foreground="grey", font=("TkDefaultFont", 8)).pack(side=tk.LEFT)
 
     def _open_and_run(self, mode):
