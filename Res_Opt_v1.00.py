@@ -68,9 +68,12 @@ import sys
 import threading
 import queue
 
-VERSION = "1.28"
+VERSION = "1.29"
 
 CHANGELOG = {
+    "1.29": "Robust Fundamental input: _get_f_fundamental() wraps all .get() calls "
+            "with try/except, resets to 33 MHz on invalid input instead of crashing. "
+            "Large Fundamental entry uses tk.Entry (reliable font support).",
     "1.28": "Rser optimisation now tweaks Cs via coordinate descent (reseed=False) "
             "at each Rser candidate instead of holding Cs fixed. Preserves "
             "optimised Cs values and avoids full redistribution. Writes tweaked Cs "
@@ -308,8 +311,8 @@ class ResonatorApp:
         fund_frame.grid(row=3, column=0, sticky="ew", pady=(2, 2))
         ttk.Label(fund_frame, text="Fundamental (MHz):",
                   font=("TkDefaultFont", 16, "bold")).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Entry(fund_frame, textvariable=self.f_fundamental,
-                  width=8, font=("TkDefaultFont", 16)).pack(side=tk.LEFT)
+        tk.Entry(fund_frame, textvariable=self.f_fundamental,
+                 width=8, font=("TkDefaultFont", 16)).pack(side=tk.LEFT)
 
         # ── Status bar ─────────────────────────────────────────────────────
         status_frame = ttk.Frame(main_frame, padding="2")
@@ -757,7 +760,7 @@ class ResonatorApp:
                     mags_d, phases_d, _ = self._load_stimulus()
                 except Exception:
                     mags_d, phases_d = [1.0], [0.0]
-                f0_d     = self.f_fundamental.get() * 1e6
+                f0_d     = self._get_f_fundamental() * 1e6
                 Rload_d  = self.Rload.get();  Cload_d = self.Cload.get()
                 Lload_d  = self.Lload.get();  Rser_d  = self.Rser.get()
                 R_div2_d = self.R_div2.get(); R_div1_d= self.R_div1.get()
@@ -923,6 +926,14 @@ class ResonatorApp:
     # -----------------------------------------------------------------------
     # Cs OPTIMIZATION  — maximise current ratio |Iload/Iser| at each harmonic
     # -----------------------------------------------------------------------
+    def _get_f_fundamental(self):
+        """Return fundamental frequency in MHz, falling back to 33.0 on bad input."""
+        try:
+            return float(self._get_f_fundamental())
+        except (tk.TclError, ValueError):
+            self.f_fundamental.set(33.0)
+            return 33.0
+
     def _invalidate_cs(self, *_):
         """Mark Cs stale when Cload, Rload, or Fund. changes after optimization."""
         if self._cs_optimized:
@@ -1096,7 +1107,7 @@ class ResonatorApp:
         self._led_start()
         self._opt_btn.configure(state="disabled", style="TButton")
 
-        f0     = self.f_fundamental.get() * 1e6
+        f0     = self._get_f_fundamental() * 1e6
         Rload  = self.Rload.get()
         Cload  = self.Cload.get()
         Lload  = self.Lload.get()
@@ -1414,7 +1425,7 @@ class ResonatorApp:
         e.g.  BP8_16_f=49.5MHz_db=0805CS.csv
         """
         N    = self.ga_n_res.get()
-        f0   = self.f_fundamental.get()
+        f0   = self._get_f_fundamental()
         # DB name: stem of loaded file, strip _SPICE_parameters suffix
         db_path = self.inductor_db_path.get()
         db_stem = os.path.splitext(os.path.basename(db_path))[0]
@@ -1498,7 +1509,7 @@ class ResonatorApp:
         POP    = self.ga_pop.get()
         N_GEN  = self.ga_gen.get()
 
-        f0     = self.f_fundamental.get() * 1e6
+        f0     = self._get_f_fundamental() * 1e6
         Rload  = self.Rload.get()
         Cload  = self.Cload.get()
         Lload  = self.Lload.get()
@@ -2181,7 +2192,7 @@ class ResonatorApp:
             messagebox.showerror("Stimulus error", str(e))
             return
 
-        f0     = self.f_fundamental.get() * 1e6
+        f0     = self._get_f_fundamental() * 1e6
         Rload  = self.Rload.get()
         Cload  = self.Cload.get()
         Lload  = self.Lload.get()
@@ -2737,7 +2748,7 @@ class ResonatorApp:
             self.axes[4].legend(fontsize=7, loc='best')
         
         # Harmonics
-        f_fund_val = self.f_fundamental.get()
+        f_fund_val = self._get_f_fundamental()
         f_start = self.f_min.get()
         f_end = self.f_max.get()
         n = 1
@@ -2752,7 +2763,7 @@ class ResonatorApp:
             current_harmonic = f_fund_val * n
 
         self.last_filename = self._build_save_filename(
-            'freq', self.f_fundamental.get() * 1e6, res_params)
+            'freq', self._get_f_fundamental() * 1e6, res_params)
         data = {
             'Frequency_MHz':    freqs / 1e6,
             'I_ser_RMS':        plot_Iser,
@@ -2774,7 +2785,7 @@ class ResonatorApp:
     # STEADY STATE ANALYSIS
     # --------------------------------------------------------------------------------
     def _run_steady_state_analysis(self, v_rms_mv, R_gen_int, R_div1, R_div2, C_line, Z_in_meas, Rser, Rload, Cload, Lload, res_params, mags, phases, n_harm):
-        f0 = self.f_fundamental.get() * 1e6
+        f0 = self._get_f_fundamental() * 1e6
         w0 = 2 * np.pi * f0
         T = 5 / f0
         t = np.linspace(0, T, 2**14, endpoint=False)
