@@ -68,9 +68,12 @@ import sys
 import threading
 import queue
 
-VERSION = "1.26"
+VERSION = "1.27"
 
 CHANGELOG = {
+    "1.27": "Main panel redesigned: window narrowed to 520px, Fundamental (MHz) "
+            "moved below resonator table with font size 16, default frequency "
+            "changed to 33 MHz.",
     "1.26": "SA bug-fixes: (1) seeding now evaluates all 50 candidates and picks "
             "the best, instead of stopping at the first FOM≥0. "
             "(2) Convergence window widened to 80 steps, tolerance tightened to 0.01% "
@@ -115,7 +118,7 @@ class ResonatorApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"Resonator Optimizer  v{VERSION}")
-        self.root.geometry("780x800")
+        self.root.geometry("520x800")
         _style = ttk.Style()
         _style.configure("Warn.TButton", foreground="red", font=("Helvetica", 9, "bold"))
 
@@ -212,7 +215,7 @@ class ResonatorApp:
             ttk.Label(file_frame, text=lbl, font=SF).grid(
                 row=row_i, column=0, sticky="w", pady=1, padx=(0,4))
             ttk.Label(file_frame, textvariable=var, foreground=col,
-                      font=SF, wraplength=420, justify="left").grid(
+                      font=SF, wraplength=280, justify="left").grid(
                 row=row_i, column=1, sticky="w")
 
         # ── Circuit Parameters ─────────────────────────────────────────────
@@ -234,7 +237,7 @@ class ResonatorApp:
         self.f_max          = tk.DoubleVar(value=300.0)
         self.freq_plot_type  = tk.StringVar(value="V_node")
         self.s_param_choice  = tk.StringVar(value="Both")
-        self.f_fundamental   = tk.DoubleVar(value=49.5)
+        self.f_fundamental   = tk.DoubleVar(value=33.0)
         self.subtract_ref_var = tk.BooleanVar(value=False)
         self.show_vgen_var    = tk.BooleanVar(value=True)
         self.ref_calc_var     = tk.BooleanVar(value=False)
@@ -280,14 +283,10 @@ class ResonatorApp:
         L(params_frame, "Cload (F):").grid(row=4, column=2, sticky="w", padx=PX, pady=1)
         E(params_frame, self.Cload).grid(row=4, column=3, padx=2, pady=1)
 
-        # Row 5: Fundamental frequency (used by Steady State, Cs Opt, Best Inductors)
-        L(params_frame, "Fundamental (MHz):").grid(row=5, column=0, sticky="w", padx=(0,2), pady=1)
-        E(params_frame, self.f_fundamental, w=9).grid(row=5, column=1, padx=2, pady=1)
-
-        # Row 6: Reference calculation mode
+        # Row 5: Reference calculation mode
         ttk.Checkbutton(params_frame, text="Reference Calculation (resonators OFF)",
                         variable=self.ref_calc_var).grid(
-            row=6, column=0, columnspan=4, sticky="w", padx=(0,2), pady=(4,1))
+            row=5, column=0, columnspan=4, sticky="w", padx=(0,2), pady=(4,1))
 
         # ── Resonator Grid ─────────────────────────────────────────────────
         res_params_frame = ttk.LabelFrame(main_frame,
@@ -300,9 +299,17 @@ class ResonatorApp:
         self.resonator_vars = []
         self.resonator_entry_widgets = []
 
+        # ── Fundamental frequency ──────────────────────────────────────────
+        fund_frame = ttk.Frame(main_frame, padding="4")
+        fund_frame.grid(row=3, column=0, sticky="ew", pady=(2, 2))
+        ttk.Label(fund_frame, text="Fundamental (MHz):",
+                  font=("TkDefaultFont", 16, "bold")).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Entry(fund_frame, textvariable=self.f_fundamental,
+                  width=8, font=("TkDefaultFont", 16)).pack(side=tk.LEFT)
+
         # ── Status bar ─────────────────────────────────────────────────────
         status_frame = ttk.Frame(main_frame, padding="2")
-        status_frame.grid(row=3, column=0, sticky="ew", pady=(0,2))
+        status_frame.grid(row=4, column=0, sticky="ew", pady=(0,2))
         status_frame.columnconfigure(1, weight=1)
 
         self._led_canvas = tk.Canvas(status_frame, width=12, height=12,
@@ -324,7 +331,7 @@ class ResonatorApp:
         ttk.Label(main_frame,
                   text=f"Resonator Optimizer Ver. {VERSION}",
                   font=("Helvetica", 12, "bold"), foreground="blue"
-                  ).grid(row=4, column=0, pady=(2,4))
+                  ).grid(row=5, column=0, pady=(2,4))
 
         # Traces — after all vars are defined
         self.Cload.trace_add("write", self._invalidate_cs)
