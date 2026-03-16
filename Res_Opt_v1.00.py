@@ -68,9 +68,15 @@ import sys
 import threading
 import queue
 
-VERSION = "1.25"
+VERSION = "1.26"
 
 CHANGELOG = {
+    "1.26": "SA bug-fixes: (1) seeding now evaluates all 50 candidates and picks "
+            "the best, instead of stopping at the first FOM≥0. "
+            "(2) Convergence window widened to 80 steps, tolerance tightened to 0.01% "
+            "to prevent premature early-exit at ~30% FOM. "
+            "(3) Default T0 raised from 5 to 20 (FOM% units) so SA can escape "
+            "shallow local optima early in the search.",
     "1.0":  "Initial release: Resonator Optimizer with GA/Greedy search, "
             "Cs optimisation, steady-state and frequency analysis.",
     "1.01": "Cs scan ceiling raised from 200 pF to 1000 pF. "
@@ -142,7 +148,7 @@ class ResonatorApp:
         self.ga_rser_min     = tk.DoubleVar(value=10.0)   # Ω
         self.ga_rser_max     = tk.DoubleVar(value=1000.0) # Ω
         # SA parameters
-        self.sa_t0    = tk.DoubleVar(value=5.0)   # initial temperature (FOM % units)
+        self.sa_t0    = tk.DoubleVar(value=20.0)   # initial temperature (FOM % units)
         self.sa_alpha = tk.DoubleVar(value=0.97)  # cooling rate per step
         self.sa_iters = tk.IntVar(value=300)       # total SA steps
 
@@ -2029,8 +2035,7 @@ class ResonatorApp:
                         best_seed_fom = trial_fom
                         best_seed_ind = trial_ind[:]
                         best_seed_par = trial_par
-                    if best_seed_fom >= 0:
-                        break   # good enough — stop early
+                    # keep trying all attempts to find the best seed
 
                 current_ind = best_seed_ind[:]
                 current_fom = best_seed_fom
@@ -2048,8 +2053,8 @@ class ResonatorApp:
                 q.put(('gen', 0, fom_history[:], accept_history[:],
                        best_ind, best_par, best_fom))
 
-                CONVERGE_WINDOW = 20   # steps
-                CONVERGE_TOL   = 0.05  # % — stop if best FOM gains less than this
+                CONVERGE_WINDOW = 80   # steps
+                CONVERGE_TOL   = 0.01  # % — stop if best FOM gains less than this
 
                 for step in range(1, iters_sa + 1):
                     if not self._ga_running:
