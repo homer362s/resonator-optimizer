@@ -68,9 +68,29 @@ import sys
 import threading
 import queue
 
-VERSION = "1.35"
+VERSION = "1.39"
 
 CHANGELOG = {
+    "1.39": "Added harmonic number as explicit column 7 of params array (N,8). "
+            "harm# is set at construction time and preserved through pruning, sorting, "
+            "and GUI round-trips. _joint_optimise_cs and _cs_for_max_ratio now use "
+            "params[:,7] instead of slot index.",
+    "1.38": "Fix Cs upper bound: cap cs_max at 20×Cp in _cs_for_max_ratio. "
+            "When Cs>>Cp the anti-resonance frequency becomes independent of Cs, "
+            "causing optimizer to park at 1000pF which is physically meaningless "
+            "for Cp=0.5pF.",
+    "1.37": "Fix resonator ordering after Best Inductors leave-one-out pruning: "
+            "keep list now sorted by L ascending so slot i always targets harmonic "
+            "(i+1)*f0 as assumed by _joint_optimise_cs. "
+            "Also exempt slot 0 from best_ratio≤1 and FIX-6 rejection: for a "
+            "resistive load the ratio never exceeds 1 for a single resonator, "
+            "and the simplified f_ar formula can fall just below f0 causing "
+            "false rejection of valid fundamental resonators.",
+    "1.36": "Removed '⟳ Iterate Rser+Cs' button (damaged FOM by re-seeding Cs). "
+            "Optimize Rser button now always enabled. "
+            "Sub-harmonic series-resonance fix: for harmonic slots (index ≥ 1) "
+            "also reject if f_ser = 1/(2π√(L·Cs)) < f0 — prevents low-impedance "
+            "notches below the fundamental that FIX-6 (anti-resonance check) missed.",
     "1.35": "Added _run_iterate_optimization: alternating Cs / Rser optimisation "
             "that finds the joint steady solution. New button '⟳ Iterate Rser+Cs' "
             "in the Best Inductors window. Each round: (1) re-optimise Cs with "
@@ -734,6 +754,8 @@ class ResonatorApp:
             new_rows.append([R1, C1, L, k, R_DC, Cs, Cp])
 
         params = np.array(new_rows)
+        harm_nums = np.arange(1, len(params)+1, dtype=float).reshape(-1,1)
+        params = np.hstack([params, harm_nums])
         self.resonator_params_loaded = params.copy()
         self._populate_resonator_grid(params)
         names = [d["Part_Number"] for d in self.selected_inductors]
@@ -776,6 +798,9 @@ class ResonatorApp:
             print(f"Error loading resonators {filename}: {e}. Using defaults.")
             self.status_var.set(f"Error loading file. Used defaults.")
             params = np.array([[60.0,0.604e-12,2.7e-6,2.8e-3,3.0,3.66e-12,0.5e-12],[60.0,0.288e-12,1.2e-6,9.7e-4,3.0,2.0e-12,0.5e-12],[66.0,0.258e-12,0.56e-6,5.54e-4,1.9,1.9e-12,0.5e-12],[66.0,0.096e-12,0.32e-6,4.74e-4,1.4,2.1e-12,0.5e-12]])
+        if params.shape[1] == 7:
+            harm_nums = np.arange(1, len(params)+1, dtype=float).reshape(-1,1)
+            params = np.hstack([params, harm_nums])
             
         self.resonator_params_loaded = params.copy()
         self._populate_resonator_grid(self.resonator_params_loaded)
@@ -802,7 +827,7 @@ class ResonatorApp:
                 Z_in_d   = self.Z_in_measure.get()
                 full_p   = np.array([r for r in params if float(r[5]) >= 1e-16])
                 if len(full_p) == 0:
-                    params = np.zeros((0, 7))
+                    params = np.zeros((0, 8))
                 else:
                     fom_full = self._compute_fom(
                         full_p, f0_d, mags_d, phases_d,
@@ -817,21 +842,24 @@ class ResonatorApp:
                             Rser_d, Rload_d, Cload_d, Lload_d) if len(others) else 0.0
                         if (fom_full - fom_without) >= MIN_CONTRIB:
                             keep.append(full_p[j])
+                    keep.sort(key=lambda r: float(r[2]))  # sort by L ascending: largest L = fundamental slot 0
                     params = np.array(keep) if keep else np.zeros((0, full_p.shape[1]))
             else:
                 # Just drop inactive sentinels
                 params = np.array([r for r in params if float(r[5]) >= 1e-16])                          if len(params) > 0 else params
         if len(params) == 0:
-            params = np.zeros((0, 7))
+            params = np.zeros((0, 8))
         # Store Entry widgets directly — no DoubleVar aliasing issues
         self.resonator_entry_widgets = []   # list-of-lists of ttk.Entry
-        headers = ("#", "R1", "C1 (F)", "L (H)", "k", "R_DC", "Cs (pF)", "Cp (pF)")
+        headers = ("Harm#", "R1", "C1 (F)", "L (H)", "k", "R_DC", "Cs (pF)", "Cp (pF)")
         for col, text in enumerate(headers):
             ttk.Label(self.res_params_grid, text=text,
                       font='TkDefaultFont 9 bold').grid(row=0, column=col, padx=2, pady=2)
+        self.resonator_harm_nums = []
         for idx, row_data in enumerate(params):
-            ttk.Label(self.res_params_grid,
-                      text=f"{idx+1}").grid(row=idx+1, column=0)
+            harm_n = int(float(row_data[7])) if len(row_data) > 7 else idx + 1
+            ttk.Label(self.res_params_grid, text=f"{harm_n}").grid(row=idx+1, column=0)
+            self.resonator_harm_nums.append(harm_n)
             # Columns in display order: R1, C1(F), L(H), k, R_DC, Cs(pF), Cp(pF)
             display_vals = [
                 float(row_data[0]),          # R1      — Ohm, as-is
@@ -856,13 +884,17 @@ class ResonatorApp:
         """Read resonator params from Entry widget text in displayed row order."""
         ref_mode = self.ref_calc_var.get()
         rows = []
-        for row_widgets in self.resonator_entry_widgets:
+        harm_nums = getattr(self, 'resonator_harm_nums', [])
+        for i, row_widgets in enumerate(self.resonator_entry_widgets):
             # cols: R1, C1(F), L(H), k, R_DC, Cs(pF), Cp(pF)
-            raw = [float(w.get()) for w in row_widgets]
+            raw = [float(w.get()) for w in row_widgets[:7]]
             raw[5] *= 1e-12   # Cs: pF -> F
             raw[6] *= 1e-12   # Cp: pF -> F
             if ref_mode:
                 raw[5] = 1e-21  # 1e-9 pF — below inactive threshold, resonators open-circuit
+            # Harm# comes from the label list (column 0, not editable)
+            harm_n = float(harm_nums[i]) if i < len(harm_nums) else float(i + 1)
+            raw.append(harm_n)
             rows.append(raw)
         return np.array(rows)
 
@@ -1021,7 +1053,24 @@ class ResonatorApp:
             # FIX-2: start 1 decade below simplified estimate; actual series
             # resonance of Z_series_block (with C1 in Z_AB_parallel) can differ
             cs_min = max(0.001e-12, cs_series_res * 0.1)
+            # Sub-harmonic series-resonance prevention (harmonic slots only):
+            # f_ser = 1/(2π√(L·Cs)) ≥ f0 requires Cs ≤ 1/(L·(2π·f0)²).
+            # Cap cs_max to this limit so the grid never explores values that
+            # would place a series-resonance notch below the fundamental.
+            # Slot 0 is exempt — f_ser < f0 is unavoidable when f_ar ≈ f0.
+            if params_active[row_idx, 7] > 1:
+                f0_est = f_target / params_active[row_idx, 7]
+                cs_ser_limit = 1.0 / (L * (2.0 * np.pi * f0_est) ** 2)
+                cs_max = min(cs_max, cs_ser_limit)
         cs_max = min(cs_max, 1000e-12)   # enforce hard cap regardless of cs_min
+        # When Cs >> Cp the anti-resonance frequency stops depending on Cs
+        # (f_ar → 1/√(L·Cp)/2π). Cap Cs at 20×Cp to avoid optimizer parking
+        # at meaninglessly large Cs values.
+        Cp_val = params_active[row_idx, 6]
+        if Cp_val > 0:
+            cs_max = min(cs_max, 20.0 * Cp_val)
+        if cs_max < cs_min:
+            return 1e-17   # no valid Cs range for this inductor at this harmonic
 
         n_coarse = 60  if self._fast_eval else 500
         n_fine   = 30  if self._fast_eval else 200
@@ -1039,17 +1088,23 @@ class ResonatorApp:
         # If even the best Cs gives ratio ≤ 1 this component doesn't help at
         # f_target — mark inactive so it gets pruned rather than parking at
         # 1000 pF and pulling a subharmonic into the solution.
+        # Exception: slot 0 (fundamental) is always accepted — for a resistive
+        # load the ratio never exceeds 1.0 for a single resonator, but the
+        # resonator still contributes to FOM via anti-resonance at f0.
+        # FIX-6 below provides the necessary quality guard for slot 0.
         best_ratio = -neg_ratio(best_log_cs)
-        if best_ratio <= 1.0:
+        if best_ratio <= 1.0 and params_active[row_idx, 7] > 1:
             return 1e-17   # useless at this harmonic → inactive
         # FIX-6: sub-harmonic reject — discard if anti-resonance falls below f0.
         # f_ar ≈ sqrt((Cs+Cp)/(L·Cs·Cp)) / 2π  (simplified, ignores R1/C1).
         # If f_ar < f0 the resonator blocks below the fundamental — not useful.
+        # Slot 0 is exempt: its anti-resonance IS at f0 by design, and the
+        # simplified formula can fall just below f0 causing false rejection.
         L_val  = params_active[row_idx, 2]
         Cp_val = params_active[row_idx, 6]
-        if L_val > 0 and Cp_val > 0 and best_cs > 0:
+        if params_active[row_idx, 7] > 1 and L_val > 0 and Cp_val > 0 and best_cs > 0:
             f_ar   = np.sqrt((best_cs + Cp_val) / (L_val * best_cs * Cp_val)) / (2 * np.pi)
-            f0_est = f_target / (row_idx + 1)   # harmonic index → fundamental
+            f0_est = f_target / params_active[row_idx, 7]
             if f_ar < f0_est:
                 return 1e-17   # sub-harmonic resonator → reject
         return best_cs
@@ -1082,7 +1137,7 @@ class ResonatorApp:
             # so the L+Cs branch is net inductive at f_target.  Seed at 2x cs_series_res.
             for i in range(n_active):
                 L = params[i, 2]
-                f_target = (i + 1) * f0
+                f_target = params[i, 7] * f0
                 if L > 0:
                     cs_series_res = 1.0 / (L * (2.0 * np.pi * f_target) ** 2)
                     params[i, 5] = np.clip(cs_series_res * 2.0, 0.001e-12, 1000e-12)  # FIX-2: lower floor
@@ -1096,7 +1151,7 @@ class ResonatorApp:
         # This guarantees resonator 0 searches at f0, resonator 1 at 2*f0, etc.
         for i in range(n_active):
             params[i, 5] = self._cs_for_max_ratio(
-                params[:i + 1], i, (i + 1) * f0,
+                params[:i + 1], i, params[i, 7] * f0,
                 Rload, Cload, Lload, Rser, R_div2)
 
         # ── Step 3: coordinate-descent rounds until convergence ───────────────
@@ -1105,7 +1160,7 @@ class ResonatorApp:
             prev = params[:n_active, 5].copy()
             for i in range(n_active):
                 params[i, 5] = self._cs_for_max_ratio(
-                    params[:n_active], i, (i + 1) * f0,
+                    params[:n_active], i, params[i, 7] * f0,
                     Rload, Cload, Lload, Rser, R_div2)
             if np.all(np.abs(params[:n_active, 5] - prev) /
                       np.maximum(prev, 1e-20) < 0.005):
@@ -1220,7 +1275,7 @@ class ResonatorApp:
         def worker():
             p = params.copy()
             for k in range(N):
-                f_target_k = (k + 1) * f0
+                f_target_k = p[k, 7] * f0
                 q.put(('status',
                        f"Step {k+1}/{N}: scanning Cs{k+1} for "
                        f"{f_target_k/1e6:.2f} MHz..."))
@@ -1423,8 +1478,8 @@ class ResonatorApp:
         E_ref = np.sum(Iref_t**2) * dt * Rser
         return (E_ref - E_ser) / E_ref * 100.0 if E_ref > 1e-20 else 0.0
 
-    def _db_row_to_params(self, row, Cs=1e-12, Cp=0.5e-12):
-        """Convert a database dict row to [R1,C1,L,k,R_DC,Cs,Cp]."""
+    def _db_row_to_params(self, row, Cs=1e-12, Cp=0.5e-12, harm_num=1):
+        """Convert a database dict row to [R1,C1,L,k,R_DC,Cs,Cp,harm_num]."""
         return [
             float(row["R1_Ohm"]),
             float(row["C_pF"]) * 1e-12,
@@ -1433,6 +1488,7 @@ class ResonatorApp:
             float(row["R2_Ohm"]),
             Cs,
             Cp,
+            float(harm_num),
         ]
 
     def _optimise_cs_for_individual(self, individual, f0, db_rows,
@@ -1443,7 +1499,8 @@ class ResonatorApp:
         Returns numpy params array (N,7) with optimised Cs.
         """
         N = len(individual)
-        params = np.array([self._db_row_to_params(db_rows[i]) for i in individual])
+        params = np.array([self._db_row_to_params(db_rows[idx], harm_num=k+1)
+                           for k, idx in enumerate(individual)])
         # Seed Cs: start from individual Cs scan
         for k in range(N):
             params[k, 5] = self._cs_for_max_ratio(
@@ -1571,8 +1628,6 @@ class ResonatorApp:
             try:
                 self._optim_run_btn.configure(state="disabled")
                 self._optim_stop_btn.configure(state="normal")
-                self._optim_rser_btn.configure(state="disabled")
-                self._optim_iter_btn.configure(state="disabled")
             except Exception: pass
         except Exception: pass
         self.status_var.set("GA: initialising…")
@@ -1587,7 +1642,7 @@ class ResonatorApp:
             Returns (fom, params, individual).
             """
             if not individual:
-                return 0.0, np.zeros((0, 7)), []
+                return 0.0, np.zeros((0, 8)), []
             params = self._optimise_cs_for_individual(
                 individual, f0, db_rows, Rload, Cload, Lload, _rser_cell[0], R_div2)
             fom = self._compute_fom(
@@ -1631,6 +1686,13 @@ class ResonatorApp:
                     else:
                         cs_lo_use  = 0.01e-12
                     cs_max_use = max(1000e-12, cs_lo_use * 10)
+                    # Sub-harmonic series-resonance prevention (harmonic slots only):
+                    # cap cs_max_use so f_ser = 1/(2π√(L·Cs)) stays ≥ f0.
+                    if k > 0 and L_cand > 0:
+                        cs_ser_limit = 1.0 / (L_cand * (2.0 * np.pi * f0) ** 2)
+                        cs_max_use = min(cs_max_use, cs_ser_limit)
+                    if cs_max_use < cs_lo_use:
+                        row = cand_row.copy(); row[0, 5] = 1e-17; return row
                     Cs_arr = np.logspace(np.log10(cs_lo_use), np.log10(cs_max_use), 120)
 
                     Y_locked = 0j
@@ -1638,7 +1700,7 @@ class ResonatorApp:
                         Y_locked += 1.0 / self.calculate_single_resonator_impedance(
                             f_target, greedy_params[i])
 
-                    R1, C1, L, kc, R_DC, _, Cp = cand_row[0]
+                    R1, C1, L, kc, R_DC, _, Cp = cand_row[0, :7]
                     ZA   = R1 + 1.0 / (1j * w * C1)
                     ZB   = (kc * np.sqrt(f_target) + R_DC) + 1j * w * L
                     Zp   = 1.0 / (1.0/ZA + 1.0/ZB)
@@ -1666,7 +1728,7 @@ class ResonatorApp:
                     return row
 
                 greedy_ind    = []
-                greedy_params = np.zeros((0, 7))
+                greedy_params = np.zeros((0, 8))
 
                 import time as _time
                 for k in range(N):
@@ -1710,7 +1772,7 @@ class ResonatorApp:
                     ratio_scores = []   # (ratio, di)
                     f_target = (k + 1) * f0
                     for di in range(DB_SIZE):
-                        cand_row = np.array([self._db_row_to_params(db_rows[di])])
+                        cand_row = np.array([self._db_row_to_params(db_rows[di], harm_num=k+1)])
                         cand_row = greedy_cs_pretune(cand_row, k)
                         active = np.vstack([greedy_params, cand_row])                                  if len(greedy_params) else cand_row
                         ratio = self._current_ratio_at(
@@ -1931,7 +1993,7 @@ class ResonatorApp:
             tb = traceback.format_exc()
             print(f"GA WORKER EXCEPTION:\n{tb}")   # always visible in console
             q.put(('status', f"ERROR: {_ex}"))
-            q.put(('stopped', best_ind, best_par if best_par is not None else np.zeros((0,7)),
+            q.put(('stopped', best_ind, best_par if best_par is not None else np.zeros((0,8)),
                    best_fom, db_rows, gen_best[:], gen_mean[:]))
 
         # ── poll ─────────────────────────────────────────────────────────
@@ -2045,8 +2107,6 @@ class ResonatorApp:
                     try:
                         self._optim_run_btn.configure(state="normal")
                         self._optim_stop_btn.configure(state="disabled")
-                        self._optim_rser_btn.configure(state="normal")
-                        self._optim_iter_btn.configure(state="normal")
                     except Exception: pass
                     self._save_ga_progress_prompt(gb_final, gm_final, names, best_fom)
                     done_flag = True
@@ -2112,7 +2172,7 @@ class ResonatorApp:
 
                 for attempt in range(MAX_SEED):
                     if not self._ga_running:
-                        q.put(('stopped', best_seed_ind, best_seed_par or np.zeros((0,7)),
+                        q.put(('stopped', best_seed_ind, best_seed_par or np.zeros((0,8)),
                                best_seed_fom, db_rows, [], []))
                         return
                     q.put(('status',
@@ -2221,7 +2281,7 @@ class ResonatorApp:
                 q.put(('status', f"SA ERROR: {_ex}"))
                 q.put(('stopped',
                        best_ind if 'best_ind' in dir() else [],
-                       best_par if 'best_par' in dir() else np.zeros((0, 7)),
+                       best_par if 'best_par' in dir() else np.zeros((0, 8)),
                        best_fom if 'best_fom' in dir() else 0.0,
                        db_rows, [], []))
 
@@ -2331,129 +2391,6 @@ class ResonatorApp:
             self.status_var.set(
                 f"Rser opt done: best Rser={best_rser:.1f} Ω  FOM={best_fom:.2f}%")
             try:
-                self._optim_rser_btn.configure(state="normal")
-                self._optim_run_btn.configure(state="normal")
-            except Exception: pass
-
-        import threading as _thr
-        _thr.Thread(target=worker, daemon=True).start()
-
-    def _run_iterate_optimization(self):
-        """
-        Alternating (Cs, Rser) optimisation — finds the joint steady solution.
-
-        Each round:
-          1. Optimise Cs with the current Rser  (_joint_optimise_cs)
-          2. Sweep Rser via golden-section with those fixed Cs
-        Repeat until FOM change < 0.02 % or MAX_ROUNDS reached.
-
-        Both best Rser and best Cs are written back to the GUI at the end.
-        """
-        params = self._get_resonator_params_from_gui()
-        N = len(params)
-        if N == 0:
-            from tkinter import messagebox
-            messagebox.showwarning("No resonators", "Load resonators first.")
-            return
-
-        rser_lo = self.ga_rser_min.get()
-        rser_hi = self.ga_rser_max.get()
-        if rser_lo >= rser_hi or rser_lo <= 0:
-            from tkinter import messagebox
-            messagebox.showwarning("Invalid range",
-                                   f"Rser range {rser_lo}–{rser_hi} Ω is invalid.")
-            return
-
-        try:
-            mags, phases, _ = self._load_stimulus()
-        except Exception as e:
-            from tkinter import messagebox
-            messagebox.showerror("Stimulus error", str(e))
-            return
-
-        f0     = self._get_f_fundamental() * 1e6
-        Rload  = self.Rload.get()
-        Cload  = self.Cload.get()
-        Lload  = self.Lload.get()
-        R_div2 = self.R_div2.get()
-        R_div1 = self.R_div1.get()
-        R_gen  = self.R_internal_gen.get()
-        Z_in   = self.Z_in_measure.get()
-        C_line = 0.0
-        Rser_start = self.Rser.get()
-
-        self._led_start()
-        try:
-            self._optim_iter_btn.configure(state="disabled")
-            self._optim_rser_btn.configure(state="disabled")
-            self._optim_run_btn.configure(state="disabled")
-        except Exception: pass
-        self.status_var.set("Iterate Rser+Cs: starting…")
-        self.root.update_idletasks()
-
-        def worker():
-            PHI = (np.sqrt(5) - 1) / 2
-            GS_ITERS   = 12
-            MAX_ROUNDS = 6
-            CONV_TOL   = 0.02   # % — stop when ΔFOM < this
-
-            p = params.copy()
-            cur_rser = Rser_start
-            prev_fom = None
-
-            for rnd in range(MAX_ROUNDS):
-                # ── Step A: optimise Cs with current Rser ─────────────────────
-                self.root.after(0, lambda r=rnd: self.status_var.set(
-                    f"Iterate {r+1}/{MAX_ROUNDS}: optimising Cs (Rser={cur_rser:.1f} Ω)…"))
-                self._joint_optimise_cs(
-                    p, N, f0,
-                    Rload, Cload, Lload, cur_rser, R_div2,
-                    reseed=(rnd == 0))
-
-                # ── Step B: golden-section over Rser with fixed Cs ────────────
-                self.root.after(0, lambda r=rnd: self.status_var.set(
-                    f"Iterate {r+1}/{MAX_ROUNDS}: sweeping Rser…"))
-
-                def fom_at(rser_val, _p=p):
-                    return self._compute_fom(
-                        _p, f0, mags, phases,
-                        R_gen, R_div1, R_div2, C_line, Z_in,
-                        rser_val, Rload, Cload, Lload)
-
-                a, b = rser_lo, rser_hi
-                c = b - PHI * (b - a)
-                d = a + PHI * (b - a)
-                fc = fom_at(c)
-                fd = fom_at(d)
-                for _ in range(GS_ITERS - 2):
-                    if fc > fd:
-                        b = d; d, fd = c, fc
-                        c = b - PHI * (b - a); fc = fom_at(c)
-                    else:
-                        a = c; c, fc = d, fd
-                        d = a + PHI * (b - a); fd = fom_at(d)
-                cur_rser = (a + b) / 2.0
-                new_fom  = fom_at(cur_rser)
-
-                # ── Convergence check ─────────────────────────────────────────
-                if prev_fom is not None and abs(new_fom - prev_fom) < CONV_TOL:
-                    prev_fom = new_fom
-                    break
-                prev_fom = new_fom
-
-            best_rser = cur_rser
-            best_fom  = prev_fom
-            best_p    = p.copy()
-            self.root.after(0, lambda: _done(best_rser, best_fom, best_p))
-
-        def _done(best_rser, best_fom, best_p):
-            self.Rser.set(round(best_rser, 2))
-            self._update_grid_cs(best_p)
-            self._led_stop()
-            self.status_var.set(
-                f"Iterate done: Rser={best_rser:.1f} Ω  FOM={best_fom:.2f}%")
-            try:
-                self._optim_iter_btn.configure(state="normal")
                 self._optim_rser_btn.configure(state="normal")
                 self._optim_run_btn.configure(state="normal")
             except Exception: pass
@@ -2742,16 +2679,8 @@ class ResonatorApp:
             self._optim_stop_btn.pack(side=tk.LEFT, padx=(0,12))
             ttk.Separator(r4, orient="vertical").pack(side=tk.LEFT, fill="y", padx=6)
             self._optim_rser_btn = ttk.Button(r4, text="⚙ Optimize Rser",
-                                               command=self._run_rser_optimization,
-                                               state="disabled")
+                                               command=self._run_rser_optimization)
             self._optim_rser_btn.pack(side=tk.LEFT, padx=(0,4))
-            ttk.Separator(r4, orient="vertical").pack(side=tk.LEFT, fill="y", padx=6)
-            self._optim_iter_btn = ttk.Button(r4, text="⟳ Iterate Rser+Cs",
-                                               command=self._run_iterate_optimization,
-                                               state="disabled")
-            self._optim_iter_btn.pack(side=tk.LEFT, padx=(0,4))
-            ttk.Label(r4, text="(joint steady solution)",
-                      foreground="grey", font=("TkDefaultFont", 8)).pack(side=tk.LEFT)
 
     def _open_and_run(self, mode):
         """Open the appropriate analysis window and immediately run it."""
@@ -2835,7 +2764,7 @@ class ResonatorApp:
             messagebox.showerror("Error", str(e)); self.status_var.set(f"Error: {e}")
 
     def calculate_single_resonator_impedance(self, f, params):
-        R1, C1, L, k, R_DC, Cs, Cp = params
+        R1, C1, L, k, R_DC, Cs, Cp = params[:7]
         if f < 1e-6: return np.inf
         if Cs < 1e-16:  return np.inf   # Cs < 1e-5 pF → open circuit, resonator inactive
         omega = 2 * np.pi * f
