@@ -1149,13 +1149,15 @@ class ResonatorApp:
         if not coord_only:
             if reseed:
                 for ii in harm_order:
-                    L        = params[ii, 2]
+                    L = params[ii, 2]; Cp = params[ii, 6]
                     f_target = params[ii, 7] * f0
-                    if L > 0:
-                        cs_ser = 1.0 / (L * (2.0 * np.pi * f_target) ** 2)
-                        params[ii, 5] = np.clip(cs_ser * 2.0, 0.001e-12, 1000e-12)
+                    w_h = 2.0 * np.pi * f_target
+                    Cp_eff = Cp + Cload
+                    denom = L * Cp_eff * w_h ** 2 - 1.0
+                    if denom > 0 and L > 0:
+                        params[ii, 5] = np.clip(Cp_eff / denom, 0.001e-12, 10000e-12)
                     else:
-                        params[ii, 5] = 1e-12
+                        params[ii, 5] = 1e-12  # fallback if no analytic solution
 
             # ── Step 2: sequential forward pass in Harm# order ───────────────
             # step=0: optimize Harm#1 alone; step=1: with Harm#1 as context; …
@@ -1311,49 +1313,60 @@ class ResonatorApp:
             # harm_order[step] = row index in p for the (step+1)-th harmonic.
             harm_order = np.argsort(p[:, 7], kind='stable')
 
-            # ── Step 1: sequential forward pass in Harm# order ───────────────
-            for step, ii in enumerate(harm_order):
-                f_target_k = p[ii, 7] * f0
-                q.put(('status',
-                       f"Harm#{int(p[ii,7])}: scanning Cs for "
-                       f"{f_target_k/1e6:.2f} MHz..."))
-                subset = p[harm_order[:step + 1]]   # copy in Harm# order so far
-                p[ii, 5] = self._cs_for_max_ratio(
-                    subset, step, f_target_k,
-                    Rload, Cload, Lload, Rser, R_div2)
+            # ── Step 1: analytic Cs seeding ───────────────────────────────────
+            # Cs = (Cp + Cload) / (L*(Cp+Cload)*ω² − 1)
+            q.put(('status', "Step 1: computing initial Cs analytically…"))
+            for ii in harm_order:
+                L = p[ii, 2]; Cp = p[ii, 6]; harm_n = p[ii, 7]
+                f_target = harm_n * f0
+                w_h = 2.0 * np.pi * f_target
+                Cp_eff = Cp + Cload
+                denom = L * Cp_eff * w_h ** 2 - 1.0
+                if denom <= 0 or L <= 0:
+                    q.put(('error',
+                           f"No solution for Harm#{int(harm_n)} at "
+                           f"{f_target/1e6:.1f} MHz: L·(Cp+Cload)·ω² ≤ 1"))
+                    return
+                p[ii, 5] = np.clip(Cp_eff / denom, 0.001e-12, 10000e-12)
 
-                snap = p[harm_order[:step + 1]].copy()
-                ratio_vals = np.array([
-                    self._current_ratio_at(f, snap, Rload, Cload, Lload, Rser, R_div2)
-                    for f in f_plot])
-                Z_curves = [
-                    np.array([abs(self.calculate_single_resonator_impedance(f, snap[j]))
-                               for f in f_plot])
-                    for j in range(len(snap))]
-                q.put(('step', step, snap, ratio_vals, Z_curves))
+            # Plot analytic initial state (all N resonators at once)
+            snap0 = p[harm_order].copy()
+            ratio_vals0 = np.array([
+                self._current_ratio_at(f, snap0, Rload, Cload, Lload, Rser, R_div2)
+                for f in f_plot])
+            Z_curves0 = [
+                np.array([abs(self.calculate_single_resonator_impedance(f, snap0[j]))
+                           for f in f_plot])
+                for j in range(len(snap0))]
+            analytic_label = ("Analytic: " +
+                              ", ".join([f"L{i+1}={snap0[i,5]*1e12:.3g}pF"
+                                         for i in range(len(snap0))]))
+            q.put(('step', 0, snap0, ratio_vals0, Z_curves0, analytic_label))
 
-            # ── Step 2: joint coordinate descent — adjust all Cs together ────
-            if N > 1:
-                q.put(('status', f"Joint refinement: coordinate descent on all {N} Cs..."))
-                self._joint_optimise_cs(p, N, f0,
-                                        Rload, Cload, Lload, Rser, R_div2,
-                                        coord_only=True)
-                snap2 = p[harm_order].copy()
-                ratio_vals2 = np.array([
-                    self._current_ratio_at(f, snap2, Rload, Cload, Lload, Rser, R_div2)
-                    for f in f_plot])
-                Z_curves2 = [
-                    np.array([abs(self.calculate_single_resonator_impedance(f, snap2[j]))
-                               for f in f_plot])
-                    for j in range(len(snap2))]
-                q.put(('refine', N - 1, snap2, ratio_vals2, Z_curves2))
+            # ── Step 2: fine-tune — coordinate descent on all Cs ─────────────
+            q.put(('status', f"Step 2: fine-tuning Cs (coordinate descent)…"))
+            self._joint_optimise_cs(p, N, f0,
+                                    Rload, Cload, Lload, Rser, R_div2,
+                                    coord_only=True)
+            snap1 = p[harm_order].copy()
+            ratio_vals1 = np.array([
+                self._current_ratio_at(f, snap1, Rload, Cload, Lload, Rser, R_div2)
+                for f in f_plot])
+            Z_curves1 = [
+                np.array([abs(self.calculate_single_resonator_impedance(f, snap1[j]))
+                           for f in f_plot])
+                for j in range(len(snap1))]
+            refined_label = ("Refined: " +
+                             ", ".join([f"L{i+1}={snap1[i,5]*1e12:.3g}pF"
+                                        for i in range(len(snap1))]))
+            q.put(('refine', 0, snap1, ratio_vals1, Z_curves1, refined_label))
 
             q.put(('done', p.copy()))
 
         # Accumulated ratio curves (one per step) for ghost lines
         ratio_history = []   # list of np arrays
 
-        def _paint(k, snap, ratio_vals, Z_curves, is_refine=False):
+        def _paint(k, snap, ratio_vals, Z_curves, is_refine=False, label=None):
             """
             Pure drawing — all numpy arrays already computed in worker thread.
             Only set_data() calls and draw_idle() here, zero computation.
@@ -1361,7 +1374,8 @@ class ResonatorApp:
             if is_refine:
                 # Update current step's bold line and Z lines in-place
                 bold_lines[k].set_data(f_MHz, ratio_vals)
-                bold_lines[k].set_label(f"Step {k+1}: +L{k+1} "
+                bold_lines[k].set_label(label or
+                                        f"Step {k+1}: +L{k+1} "
                                         f"Cs={snap[k,5]*1e12:.3g}pF ✓")
                 ratio_history[k] = ratio_vals   # replace with refined values
             else:
@@ -1373,11 +1387,12 @@ class ResonatorApp:
                     bold_lines[prev_k].set_visible(False)
 
                 bold_lines[k].set_data(f_MHz, ratio_vals)
-                bold_lines[k].set_label(f"Step {k+1}: +L{k+1} "
+                bold_lines[k].set_label(label or
+                                        f"Step {k+1}: +L{k+1} "
                                         f"Cs={snap[k,5]*1e12:.3g}pF")
                 bold_lines[k].set_visible(True)
 
-                for i in range(k + 1):
+                for i in range(len(Z_curves)):
                     harm_vlines_ratio[i].set_alpha(0.55)
                     harm_vlines_Z[i].set_alpha(0.45)
 
@@ -1415,11 +1430,22 @@ class ResonatorApp:
                     self.root.update_idletasks()
 
                 elif msg[0] in ('step', 'refine'):
-                    _, k, snap, ratio_vals, Z_curves = msg
+                    k, snap, ratio_vals, Z_curves = msg[1], msg[2], msg[3], msg[4]
+                    label = msg[5] if len(msg) > 5 else None
                     self._update_grid_cs(snap)
                     _paint(k, snap, ratio_vals, Z_curves,
-                           is_refine=(msg[0] == 'refine'))
+                           is_refine=(msg[0] == 'refine'), label=label)
                     # _paint calls canvas.draw() + root.update() — screen updated here
+
+                elif msg[0] == 'error':
+                    self.status_var.set(msg[1])
+                    try:
+                        self._led_stop()
+                        self._opt_btn.configure(style="TButton", state="normal")
+                    except Exception:
+                        pass
+                    messagebox.showwarning("Cs Optimisation", msg[1])
+                    return  # stop polling
 
                 elif msg[0] == 'done':
                     _, final = msg
